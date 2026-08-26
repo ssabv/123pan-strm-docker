@@ -129,24 +129,46 @@ func (a *App) getFileURLOnce(name, etag string, size int64, fastMode bool) strin
 	}
 	downloadLink, _ := actionResult["message"].(string)
 
-	// 删除缓存文件夹（24h 清理）——仅在自动创建缓存目录模式下生效，
-	// 手动指定的文件夹由用户自行管理，不自动删除
-	if !manualCacheFolder {
-		if ld, ok := cacheData["lastDeleteTime"]; !ok || ld == "" {
-			cacheData["lastDeleteTime"] = float64(time.Now().Unix())
-			WriteJSONFile(a.cfg.CachePath, cacheData)
-		}
-		lastDel, _ := cacheData["lastDeleteTime"].(float64)
-		if time.Now().Unix()-int64(lastDel) > 24*60*60 {
+	// 24h 清理缓存：自动创建模式删除整个缓存目录；手动指定模式只清空目录内文件(保留用户目录)
+	if ld, ok := cacheData["lastDeleteTime"]; !ok || ld == "" {
+		cacheData["lastDeleteTime"] = float64(time.Now().Unix())
+		WriteJSONFile(a.cfg.CachePath, cacheData)
+	}
+	lastDel, _ := cacheData["lastDeleteTime"].(float64)
+	if time.Now().Unix()-int64(lastDel) > 24*60*60 {
+		if manualCacheFolder {
+			// 手动指定目录：列出目录内文件并批量删除，保留目录本身
+			res := driver.listFilesSingle(cacheFolderId)
+			if e, ok := res["error"]; ok {
+				log.Printf("[播放] 24h清理列出缓存目录失败: %v", e)
+			} else {
+				fileList := []map[string]any{}
+				for _, it := range asAnySlice(res["items"]) {
+					if im, ok := it.(map[string]any); ok {
+						if fid, ok := im["FileId"].(float64); ok && int64(fid) > 0 {
+							fileList = append(fileList, map[string]any{"FileId": fid})
+						}
+					}
+				}
+				if len(fileList) > 0 {
+					actionResult = driver.deleteFile(fileList, true)
+					if isFinish, _ := actionResult["isFinish"].(bool); !isFinish {
+						log.Printf("[播放] 24h清理清空缓存目录失败: %v", actionResult["message"])
+						return "http://222.186.21.40:33333/NGGYU.mp4"
+					}
+					log.Printf("[播放] 24h清理：已清空缓存目录 %d 个文件 (fileId=%d)", len(fileList), cacheFolderId)
+				}
+			}
+		} else {
 			actionResult = driver.deleteFile([]map[string]any{cacheFolderInfo2}, true)
 			if isFinish, _ := actionResult["isFinish"].(bool); !isFinish {
 				log.Printf("[播放] 24h清理删除缓存目录失败: %v", actionResult["message"])
 				return "http://222.186.21.40:33333/NGGYU.mp4"
 			}
 			log.Printf("[播放] 24h清理：已彻底删除缓存目录 fileId=%d", cacheFolderId)
-			cacheData["lastDeleteTime"] = float64(time.Now().Unix())
-			WriteJSONFile(a.cfg.CachePath, cacheData)
 		}
+		cacheData["lastDeleteTime"] = float64(time.Now().Unix())
+		WriteJSONFile(a.cfg.CachePath, cacheData)
 	}
 
 	// 解析跳转链接
