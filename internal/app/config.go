@@ -7,8 +7,17 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+// 库列表摘要缓存：库文件动辄几十 MB，列表接口只需 id/名称/文件数，
+// 命中时按 (mtime, size) 判定，避免每次都完整反序列化
+type libSummary struct {
+	mtime time.Time
+	size  int64
+	row   map[string]any
+}
 
 type Config struct {
 	DataDir           string
@@ -23,6 +32,9 @@ type Config struct {
 	DefaultServerBase string
 
 	settings map[string]any
+
+	libSumMu sync.Mutex
+	libSums  map[string]libSummary
 }
 
 func NewConfig(baseDir string) *Config {
@@ -310,47 +322,90 @@ func (c *Config) ListLibraries() []map[string]any {
 	if err != nil {
 		return rows
 	}
-	// 按修改时间倒序
-	sort.Slice(entries, func(i, j int) bool {
-		si, _ := os.Stat(entries[i])
-		sj, _ := os.Stat(entries[j])
-		return si.ModTime().After(sj.ModTime())
-	})
+	type fileStat struct {
+		id  string
+		mod time.Time
+		sz  int64
+	}
+	stats := make([]fileStat, 0, len(entries))
 	for _, p := range entries {
-		d, err := c.LoadLib(strings.TrimSuffix(filepath.Base(p), ".json"))
+		fi, err := os.Stat(p)
 		if err != nil {
 			continue
 		}
-		id, _ := d["id"].(string)
-		if id == "" {
-			id = strings.TrimSuffix(filepath.Base(p), ".json")
-		}
-		name, _ := d["name"].(string)
-		if name == "" {
-			name = id
-		}
-		cat, _ := d["category"].(string)
-		files, _ := d["files"].([]any)
-		total := len(files)
-		video := 0
-		for _, f := range files {
-			if fm, ok := f.(map[string]any); ok {
-				fp, _ := fm["path"].(string)
-				if VIDEO_EXTS[strings.ToLower(filepath.Ext(fp))] {
-					video++
-				}
-			}
-		}
-		rows = append(rows, map[string]any{
-			"id":        id,
-			"name":      name,
-			"total":     total,
-			"video":     video,
-			"createdAt": d["createdAt"],
-			"category":  cat,
+		stats = append(stats, fileStat{
+			id:  strings.TrimSuffix(filepath.Base(p), ".json"),
+			mod: fi.ModTime(),
+			sz:  fi.Size(),
 		})
 	}
+	// 按修改时间倒序
+	sort.Slice(stats, func(i, j int) bool { return stats[i].mod.After(stats[j].mod) })
+	for _, s := range stats {
+		if row := c.libSummaryCached(s.id, s.mod, s.sz); row != nil {
+			rows = append(rows, row)
+		}
+	}
 	return rows
+}
+
+// 命中 (mtime, size) 一致的缓存则直接返回，否则重新解析并缓存
+func (c *Config) libSummaryCached(id string, mod time.Time, size int64) map[string]any {
+	c.libSumMu.Lock()
+	if s, ok := c.libSums[id]; ok && s.size == size && s.mtime.Equal(mod) {
+		c.libSumMu.Unlock()
+		return s.row
+	}
+	c.libSumMu.Unlock()
+
+	d, err := c.LoadLib(id)
+	if err != nil {
+		return nil
+	}
+	libID, _ := d["id"].(string)
+	if libID == "" {
+		libID = id
+	}
+	name, _ := d["name"].(string)
+	if name == "" {
+		name = libID
+	}
+	cat, _ := d["category"].(string)
+	fileList, _ := d["files"].([]any)
+	total := len(fileList)
+	video := 0
+	for _, f := range fileList {
+		if fm, ok := f.(map[string]any); ok {
+			fp, _ := fm["path"].(string)
+			if VIDEO_EXTS[strings.ToLower(filepath.Ext(fp))] {
+				video++
+			}
+		}
+	}
+	row := map[string]any{
+		"id":        libID,
+		"name":      name,
+		"total":     total,
+		"video":     video,
+		"createdAt": d["createdAt"],
+		"category":  cat,
+	}
+
+	c.libSumMu.Lock()
+	if c.libSums == nil {
+		c.libSums = map[string]libSummary{}
+	}
+	c.libSums[id] = libSummary{mtime: mod, size: size, row: row}
+	c.libSumMu.Unlock()
+	return row
+}
+
+// 库文件被改写后丢弃对应缓存，避免出现旧名称/旧文件数
+func (c *Config) invalidateLibSummary(p string) {
+	id := strings.TrimSuffix(filepath.Base(p), ".json")
+	c.libSumMu.Lock()
+	delete(c.libSums, id)
+	c.libSumMu.Unlock()
 }
 
 func firstString(m map[string]any, keys ...string) string {

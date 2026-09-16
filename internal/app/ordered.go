@@ -53,4 +53,5 @@ func (c *Config) writeLibraryFile(p string, lib map[string]any) {
 		return
 	}
 	os.WriteFile(p, b, 0o644)
+	c.invalidateLibSummary(p)
 }

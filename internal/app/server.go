@@ -96,7 +96,7 @@ func (a *App) handler() http.Handler {
 	mux.HandleFunc("/api/archive/jobs/", a.handleArchiveJobItem)
 	mux.HandleFunc("/archive", a.handleArchivePage)
 
-	return a.cors(mux)
+	return a.cors(gzipHandler(mux))
 }
 
 func (a *App) cors(next http.Handler) http.Handler {
@@ -263,6 +263,7 @@ func (a *App) handleLibraryItem(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		p := a.cfg.LibPath(libID)
 		os.Remove(p)
+		a.cfg.invalidateLibSummary(p)
 		writeJSON(w, 200, map[string]any{"ok": true})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)

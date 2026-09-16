@@ -879,6 +879,18 @@ body {
   display: block;
 }
 
+.tree-more {
+  padding: 8px 0 10px;
+  text-align: center;
+}
+
+.tree-empty {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  padding: 12px;
+  text-align: center;
+}
+
 .file-row {
   display: flex;
   align-items: center;
@@ -2052,6 +2064,10 @@ var panStep = 1;
 var syncAllBusy = false;
 var confirmCb = null;
 var expandedLibs = {};
+// 每个库已展开的目录（key 为目录路径，壳目录用 \u0000common），刷新时用于还原展开状态
+var openDirs = {};
+// 单次渲染的最大节点数：展开一级时先渲染这么多，其余点“显示更多”再加载
+var TREE_CHUNK = 300;
 var ddValues = { ddLibCat: '', ddMergeCat: '' };
 
 function toast(msg, type) {
@@ -2477,7 +2493,7 @@ function _itemHtml(x) {
       '<span>ID: ' + esc(x.id) + '</span>' +
     '</div>' +
     '<div class="lib-actions">' +
-      '<button class="vp-btn secondary sm" onclick="toggleLib(\'' + esc(x.id) + '\',this)">展开文件</button>' +
+      '<button class="vp-btn secondary sm" onclick="toggleLibBtn(this)" data-id="' + escAttr(x.id) + '">展开文件</button>' +
       '<button class="vp-btn secondary sm" onclick="askRename(\'' + esc(x.id) + '\',\'' + esc(x.name) + '\')">重命名</button>' +
       '<button class="vp-btn secondary sm" onclick="askMerge(\'' + esc(x.id) + '\',\'' + esc(cat) + '\')">改分类</button>' +
       '<button class="vp-btn secondary sm" onclick="exportSecJson(\'' + esc(x.id) + '\')">导出秒传 json</button>' +
@@ -2535,154 +2551,394 @@ function restoreExpandedTrees() {
     (function(id) {
       var tree = document.getElementById('tree_' + id);
       if (!tree) return;
-      var fill = function() {
+      fetchLibIndex(id).then(function() {
         var t = document.getElementById('tree_' + id);
         if (!t || !libCache[id]) return;
-        t.innerHTML = renderTree(libCache[id].folders, libCache[id].files, id, libCache[id].common);
+        renderTree(id, t);
         t.classList.add('open');
         var b = t.parentElement.querySelector('.vp-btn.secondary.sm');
         if (b) b.textContent = '收起文件';
-      };
-      if (!libCache[id]) {
-        api('/api/libraries/' + id).then(function(lib) {
-          if (libCache[id]) { fill(); return; }
-          var fs = {};
-          for (var i = 0; i < lib.files.length; i++) {
-            var f = lib.files[i];
-            fs[f.path] = { etag: f.etag || '', size: parseInt(f.size) || 0, name: f.path.split('/').pop() };
-          }
-          libCache[id] = { files: fs, folders: buildFolders(fs), common: (lib.commonPath || '').replace(/^\/+|\/+$/g, '') };
-          fill();
-        }).catch(function() {});
-      } else {
-        fill();
-      }
+      }).catch(function() {});
     })(ids[i]);
   }
 }
 
-function buildFolders(files) {
-  var folders = {};
-  var keys = Object.keys(files);
+// 拉取库并建立内存索引；同一库只请求一次
+function fetchLibIndex(libId) {
+  if (libCache[libId]) return Promise.resolve(libCache[libId]);
+  return api('/api/libraries/' + encodeURIComponent(libId)).then(function(lib) {
+    var fs = {};
+    var arr = (lib && lib.files) || [];
+    for (var i = 0; i < arr.length; i++) {
+      var it = arr[i];
+      var p = String(it.path);
+      if (p.indexOf('\\') >= 0) p = p.replace(/\\/g, '/');
+      var nm = p.substring(p.lastIndexOf('/') + 1);
+      fs[p] = { etag: it.etag || '', size: parseInt(it.size) || 0, name: nm };
+    }
+    var ix = {
+      files: fs,
+      dirs: buildIndex(fs),
+      common: String((lib && lib.commonPath) || '').replace(/^\/+|\/+$/g, ''),
+      commonName: String((lib && lib.commonPath) || '').split('/').filter(Boolean).pop() || ''
+    };
+    libCache[libId] = ix;
+    return ix;
+  });
+}
+
+// ===================== 秒传库文件树：一次建索引 + 按需懒渲染 =====================
+// 设计目标：文件几十万也不卡死
+//  1) buildIndex 一次遍历建索引（O(n)），替代原先“每个目录遍历全部目录”的 O(n²) 扫描
+//  2) 展开某级目录时才渲染该级 DOM，不再一次性构建整棵树
+//  3) 单级节点超过 TREE_CHUNK 先渲染一批，其余用“显示更多”按需加载
+
+// 一次遍历建目录索引：O(n)，不带任何全表扫描
+// dirs[dir] = { files:[直接子文件], subs:[直接子目录], count:[含子目录的文件数], depth, parent }
+function buildIndex(files) {
+  var dirs = {};
+  var root = { files: [], subs: [], count: 0, depth: 0, parent: null };
+  dirs[''] = root;
+  for (var p in files) {
+    var s = p.lastIndexOf('/');
+    var dirKey = s < 0 ? '' : p.substring(0, s);
+    var d = dirs[dirKey];
+    if (d === undefined) {
+      // 收集从最近已知祖先到该目录之间缺失的层级，再自浅向深补建
+      var chain = [], cur = dirKey;
+      while (!(cur in dirs)) {
+        chain.push(cur);
+        var k = cur.lastIndexOf('/');
+        if (k < 0) break;
+        cur = cur.substring(0, k);
+      }
+      for (var j = chain.length - 1; j >= 0; j--) {
+        var key = chain[j];
+        var kk = key.lastIndexOf('/');
+        var parent = dirs[kk < 0 ? '' : key.substring(0, kk)];
+        var node = { files: [], subs: [], count: 0, depth: parent.depth + 1, parent: parent };
+        parent.subs.push(key);
+        dirs[key] = node;
+      }
+      d = dirs[dirKey];
+    }
+    d.files.push(p);
+  }
+  // 按层级从深到浅自底向上累计文件数，一次算完所有目录的 count
+  var arr = [];
+  for (var dk in dirs) arr.push(dirs[dk]);
+  arr.sort(function(a, b) { return b.depth - a.depth; });
+  for (var m = 0; m < arr.length; m++) {
+    var n = arr[m];
+    n.count += n.files.length;
+    if (n.parent) n.parent.count += n.count;
+  }
+  for (var t = 0; t < arr.length; t++) arr[t].subs.sort();
+  return dirs;
+}
+
+// 文件名排序结果缓存，避免每次渲染重复排序
+function sortFiles(d) {
+  if (!d.sortedFiles) d.sortedFiles = d.files.slice().sort();
+  return d.sortedFiles;
+}
+
+// 目录下（含所有子目录）的全部文件路径
+function filesUnderDir(dirs, dir) {
+  var out = [];
+  (function walk(d) {
+    if (!d) return;
+    out = out.concat(d.files);
+    for (var i = 0; i < d.subs.length; i++) walk(dirs[d.subs[i]]);
+  })(dirs[dir]);
+  return out;
+}
+
+// 由内存索引生成 PUT /api/libraries/{id} 所需的 files 载荷（skip 为需剔除的路径判定）
+function libFilesPayload(ix, skip) {
+  var out = [], keys = Object.keys(ix.files);
   for (var i = 0; i < keys.length; i++) {
-    var parts = keys[i].replace(/\\/g, '/').split('/');
-    var dir = parts.slice(0, -1).join('/');
-    if (!folders[dir]) folders[dir] = { children: [] };
-    folders[dir].children.push(keys[i]);
-    for (var j = parts.length - 2; j >= 1; j--) {
-      var pd = parts.slice(0, j).join('/');
-      if (!folders[pd]) folders[pd] = { children: [] };
+    var p = keys[i];
+    if (skip && skip(p)) continue;
+    var f = ix.files[p];
+    out.push({ idx: out.length, path: p, etag: f.etag, size: f.size });
+  }
+  return out;
+}
+
+// 就地删除索引中的单个文件（含祖先目录计数递减）
+function indexRemoveFile(ix, fp) {
+  if (!ix.files[fp]) return false;
+  delete ix.files[fp];
+  var s = fp.lastIndexOf('/');
+  var dir = s < 0 ? '' : fp.substring(0, s);
+  var d = ix.dirs[dir];
+  if (d) {
+    var i = d.files.indexOf(fp);
+    if (i >= 0) d.files.splice(i, 1);
+    if (d.sortedFiles) {
+      i = d.sortedFiles.indexOf(fp);
+      if (i >= 0) d.sortedFiles.splice(i, 1);
     }
   }
-  return folders;
+  var cur = dir;
+  while (true) {
+    var dd = ix.dirs[cur];
+    if (dd) dd.count = Math.max(0, dd.count - 1);
+    if (cur === '') break;
+    var k = cur.lastIndexOf('/');
+    cur = k < 0 ? '' : cur.substring(0, k);
+  }
+  return true;
 }
 
-function countDesc(folders, dir) {
-  var t = 0, c = folders[dir];
-  if (c) t = c.children.length;
-  for (var d in folders) {
-    if (d === dir || d === '') continue;
-    if (d.indexOf(dir + '/') === 0) t += countDesc(folders, d);
+// 就地删除索引中的整个目录（含所有子目录）
+function indexRemoveDir(ix, dir) {
+  var sub = [dir];
+  var keys = Object.keys(ix.dirs);
+  for (var i = 0; i < keys.length; i++) {
+    if (keys[i].indexOf(dir + '/') === 0) sub.push(keys[i]);
   }
-  return t;
+  var removed = 0;
+  for (var j = 0; j < sub.length; j++) {
+    var d = ix.dirs[sub[j]];
+    if (!d) continue;
+    for (var k = 0; k < d.files.length; k++) { delete ix.files[d.files[k]]; removed++; }
+    delete ix.dirs[sub[j]];
+  }
+  var s = dir.lastIndexOf('/');
+  var par = s < 0 ? '' : dir.substring(0, s);
+  var pd = ix.dirs[par];
+  if (pd) {
+    var idx = pd.subs.indexOf(dir);
+    if (idx >= 0) pd.subs.splice(idx, 1);
+  }
+  var cur = par;
+  while (true) {
+    var dd = ix.dirs[cur];
+    if (dd) dd.count = Math.max(0, dd.count - removed);
+    if (cur === '') break;
+    var k2 = cur.lastIndexOf('/');
+    cur = k2 < 0 ? '' : cur.substring(0, k2);
+  }
+  return removed;
 }
 
-function filesUnder(folders, dir) {
-  var a = [], c = folders[dir];
-  if (c) a = a.concat(c.children);
-  for (var d in folders) {
-    if (d === dir || d === '') continue;
-    if (d.indexOf(dir + '/') === 0) a = a.concat(filesUnder(folders, d));
-  }
-  return a;
+var TREE_CHEV = '<svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="12" height="12"><polyline points="9 18 15 12 9 6"/></svg>';
+var TREE_FOLDER = '<svg class="folder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>';
+var TREE_FILE = '<svg class="file-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>';
+var TREE_X = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+var TREE_STRIP = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg>';
+
+function libIdOfTreeEl(el) {
+  var t = el && el.closest ? el.closest('.lib-tree') : null;
+  return t ? (t.dataset.lib || '') : '';
 }
 
-function renderTree(folders, files, libId, common) {
-  var dirs = Object.keys(folders).sort(function(a, b) {
-    var da = (a.match(/\//g) || []).length, db = (b.match(/\//g) || []).length;
-    return da !== db ? da - db : a.localeCompare(b);
-  });
-  var h = '', top = [];
-  for (var i = 0; i < dirs.length; i++) {
-    if (dirs[i] === '') continue;
-    var ls = dirs[i].lastIndexOf('/'), pd = ls >= 0 ? dirs[i].substring(0, ls) : null;
-    if (!pd || !folders[pd]) top.push(dirs[i]);
-  }
-  top.sort(function(a, b) { return a.localeCompare(b); });
-  var topFiles = [];
-  for (var fk in files) {
-    if (files[fk] && fk.indexOf('/') === -1) topFiles.push(fk);
-  }
-  topFiles.sort();
-  if (common) {
-    h += renderCommonDir(common, top, topFiles, folders, files, libId);
-  } else {
-    for (var t = 0; t < top.length; t++) h += renderDir(top[t], 0, folders, files, libId);
-    for (var f = 0; f < topFiles.length; f++) h += renderFile(topFiles[f], 0, files, libId);
-  }
-  return h || '<div style="font-size:12px;color:var(--text-tertiary);padding:12px;text-align:center">无文件</div>';
-}
-
-function renderCommonDir(common, top, topFiles, folders, files, libId) {
-  var name = common.split('/').pop() || common;
-  var cnt = topFiles.length;
-  for (var i = 0; i < top.length; i++) cnt += countDesc(folders, top[i]);
-  var h = '<div>' +
-    '<div class="folder-header" style="padding-left:0" onclick="var a=this.querySelector(\'.chevron\');var b=this.parentElement.querySelector(\'.folder-body\');a.classList.toggle(\'open\');b.classList.toggle(\'open\')">' +
-      '<svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="12" height="12"><polyline points="9 18 15 12 9 6"/></svg>' +
-      '<svg class="folder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>' +
+// 目录节点：只有头部，内容留空，展开时才填充
+function dirNodeHtml(dir, depth, libId) {
+  var d = libCache[libId].dirs[dir] || { count: 0 };
+  var name = dir.split('/').pop() || dir;
+  return '<div class="tree-node" data-key="' + escAttr(dir) + '" data-dir="' + escAttr(dir) + '" data-depth="' + depth + '">' +
+    '<div class="folder-header" style="padding-left:' + (depth * 16) + 'px" onclick="onFolderClick(this)">' +
+      TREE_CHEV + TREE_FOLDER +
       '<span class="folder-name">' + esc(name) + '</span>' +
-      '<span class="folder-count">' + cnt + '</span>' +
-      '<button class="strip-btn" title="剥离壳目录" onclick="event.stopPropagation();stripCommonDir(\'' + esc(libId) + '\')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg></button>' +
+      '<span class="folder-count">' + d.count + '</span>' +
+      '<button class="strip-btn" title="剥离壳目录" onclick="event.stopPropagation();stripDirBtn(this)">' + TREE_STRIP + '</button>' +
+      '<button class="delete-btn" title="删除文件夹" onclick="event.stopPropagation();removeFolderBtn(this)">' + TREE_X + '</button>' +
     '</div>' +
-    '<div class="folder-body">';
-  for (var t = 0; t < top.length; t++) h += renderDir(top[t], 1, folders, files, libId);
-  for (var f = 0; f < topFiles.length; f++) h += renderFile(topFiles[f], 1, files, libId);
-  h += '</div></div>';
-  return h;
-}
-
-function renderDir(dir, depth, folders, files, libId) {
-  var ch = folders[dir] ? folders[dir].children || [] : [];
-  var name = dir.split('/').pop() || dir, pl = dir.split('/').length;
-  var dfs = [];
-  for (var i = 0; i < ch.length; i++) {
-    if (ch[i].replace(/\\/g, '/').split('/').length === pl + 1) dfs.push(ch[i]);
-  }
-  var sds = [];
-  for (var d in folders) {
-    if (d === dir || d === '') continue;
-    if (d.split('/').length === pl + 1 && d.indexOf(dir + '/') === 0) sds.push(d);
-  }
-  dfs.sort(); sds.sort();
-  var pad = depth * 16;
-  var cnt = countDesc(folders, dir);
-  var h = '<div>' +
-    '<div class="folder-header" style="padding-left:' + pad + 'px" onclick="var a=this.querySelector(\'.chevron\');var b=this.parentElement.querySelector(\'.folder-body\');a.classList.toggle(\'open\');b.classList.toggle(\'open\')">' +
-      '<svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="12" height="12"><polyline points="9 18 15 12 9 6"/></svg>' +
-      '<svg class="folder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>' +
-      '<span class="folder-name">' + esc(name) + '</span>' +
-      '<span class="folder-count">' + cnt + '</span>' +
-      '<button class="strip-btn" title="剥离壳目录" onclick="event.stopPropagation();stripDir(\'' + esc(libId) + '\',\'' + esc(dir) + '\')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg></button>' +
-      '<button class="delete-btn" title="删除文件夹" onclick="event.stopPropagation();removeFolder(\'' + esc(libId) + '\',\'' + esc(dir) + '\',this)"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>' +
-    '</div>' +
-    '<div class="folder-body">';
-  for (var f = 0; f < dfs.length; f++) h += renderFile(dfs[f], depth + 1, files, libId);
-  for (var s = 0; s < sds.length; s++) h += renderDir(sds[s], depth + 1, folders, files, libId);
-  h += '</div></div>';
-  return h;
-}
-
-function renderFile(fp, depth, files, libId) {
-  var info = files[fp];
-  if (!info) return '';
-  var pad = depth * 16;
-  return '<div class="file-row" style="padding-left:' + pad + 'px">' +
-    '<svg class="file-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>' +
-    '<span class="file-name" title="' + esc(info.name) + '">' + esc(info.name) + '</span>' +
-    '<span class="file-size">' + fmtSize(info.size) + '</span>' +
-    '<button class="delete-btn" title="删除" onclick="removeFile(\'' + esc(libId) + '\',\'' + esc(fp) + '\',this)"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>' +
+    '<div class="folder-body"></div>' +
   '</div>';
+}
+
+function fileRowHtml(fp, depth, libId) {
+  var info = libCache[libId].files[fp];
+  if (!info) return '';
+  return '<div class="file-row" data-path="' + escAttr(fp) + '" style="padding-left:' + (depth * 16) + 'px">' +
+    TREE_FILE +
+    '<span class="file-name" title="' + escAttr(info.name) + '">' + esc(info.name) + '</span>' +
+    '<span class="file-size">' + fmtSize(info.size) + '</span>' +
+    '<button class="delete-btn" title="删除" onclick="removeFileBtn(this)">' + TREE_X + '</button>' +
+  '</div>';
+}
+
+// 壳目录（commonPath）包装节点：展开后即根目录内容（depth 1）
+function commonNodeHtml(libId) {
+  var ix = libCache[libId];
+  var d = ix.dirs[''] || { count: 0 };
+  return '<div class="tree-node" data-key="\u0000common" data-dir="" data-depth="0">' +
+    '<div class="folder-header" style="padding-left:0" onclick="onFolderClick(this)">' +
+      TREE_CHEV + TREE_FOLDER +
+      '<span class="folder-name">' + esc(ix.commonName || ix.common) + '</span>' +
+      '<span class="folder-count">' + d.count + '</span>' +
+      '<button class="strip-btn" title="剥离壳目录" onclick="event.stopPropagation();stripCommonDirBtn(this)">' + TREE_STRIP + '</button>' +
+    '</div>' +
+    '<div class="folder-body"></div>' +
+  '</div>';
+}
+
+// 把某一级的内容填进 bodyEl（dir 为 '' 表示根），只渲染首批
+function fillDirBody(bodyEl, libId, dir, depth) {
+  bodyEl.dataset.loaded = '1';
+  bodyEl.dataset.lib = libId;
+  bodyEl.dataset.dir = dir;
+  bodyEl.dataset.depth = String(depth);
+  bodyEl.dataset.off = '0';
+  bodyEl.innerHTML = '';
+  appendChunk(bodyEl, libId, dir, depth);
+}
+
+// 追加一批节点（子目录优先，然后是文件），不足则不加“显示更多”
+function appendChunk(bodyEl, libId, dir, depth) {
+  var ix = libCache[libId];
+  if (!ix) return;
+  var d = ix.dirs[dir];
+  var old = bodyEl.querySelector('.tree-more');
+  if (old && old.parentElement === bodyEl) bodyEl.removeChild(old);
+  if (!d) {
+    bodyEl.insertAdjacentHTML('beforeend', '<div class="tree-empty">无文件</div>');
+    return;
+  }
+  var subs = d.subs, files = sortFiles(d);
+  var total = subs.length + files.length;
+  var off = parseInt(bodyEl.dataset.off) || 0;
+  var end = Math.min(total, off + TREE_CHUNK);
+  var parts = [];
+  for (var i = off; i < end; i++) {
+    parts.push(i < subs.length ? dirNodeHtml(subs[i], depth, libId) : fileRowHtml(files[i - subs.length], depth, libId));
+  }
+  if (parts.length) bodyEl.insertAdjacentHTML('beforeend', parts.join(''));
+  bodyEl.dataset.off = String(end);
+  if (end < total) {
+    bodyEl.insertAdjacentHTML('beforeend',
+      '<div class="tree-more" data-dir="' + escAttr(dir) + '" data-depth="' + depth + '">' +
+        '<button class="vp-btn secondary sm" onclick="loadMoreBtn(this)">显示更多（剩余 ' + (total - end) + ' 项 / 共 ' + total + ' 项）</button>' +
+      '</div>');
+  }
+}
+
+function loadMoreBtn(btn) {
+  loadMoreInBody(btn.parentElement.parentElement);
+}
+
+// 在当前层级继续加载下一批（body 为该层容器）
+function loadMoreInBody(body) {
+  if (!body) return;
+  for (var i = 0; i < body.children.length; i++) {
+    var c = body.children[i];
+    if (c.classList && c.classList.contains('tree-more')) {
+      appendChunk(body, body.dataset.lib, c.dataset.dir || '', parseInt(c.dataset.depth) || 0);
+      return;
+    }
+  }
+}
+
+function findChildNode(scope, dir) {
+  for (var i = 0; i < scope.children.length; i++) {
+    var c = scope.children[i];
+    if (c.classList && c.classList.contains('tree-node') && c.dataset.dir === dir) return c;
+  }
+  return null;
+}
+
+// 逐级定位目录节点；遇到分块截断就继续加载，直到找到或确认不存在
+function ensurePath(root, libId, dir) {
+  var scope = root;
+  var cn = findTreeNode(root, '\u0000common');
+  if (cn) {
+    var cb = cn.firstElementChild.nextElementSibling;
+    if (cb.dataset.loaded !== '1') fillDirBody(cb, libId, '', 1);
+    scope = cb;
+  }
+  if (dir === '\u0000common') return cn;
+  if (dir === '') return null;
+  var parts = dir.split('/'), prefix = '', node = null;
+  for (var i = 0; i < parts.length; i++) {
+    prefix = prefix ? prefix + '/' + parts[i] : parts[i];
+    node = findChildNode(scope, prefix);
+    while (!node && scope.querySelector(':scope > .tree-more')) {
+      loadMoreInBody(scope);
+      node = findChildNode(scope, prefix);
+    }
+    if (!node) return null;
+    var body = node.firstElementChild.nextElementSibling;
+    if (body.dataset.loaded !== '1') {
+      fillDirBody(body, libId, node.dataset.dir || '', (parseInt(node.dataset.depth) || 0) + 1);
+    }
+    scope = body;
+  }
+  return node;
+}
+
+function onFolderClick(header) {
+  var node = header.parentElement;
+  var body = header.nextElementSibling;
+  if (!body || !body.classList || !body.classList.contains('folder-body')) return;
+  var opening = !body.classList.contains('open');
+  var libId = libIdOfTreeEl(header);
+  var key = node.dataset.key || '';
+  var depth = parseInt(node.dataset.depth) || 0;
+  if (opening && body.dataset.loaded !== '1') {
+    fillDirBody(body, libId, node.dataset.dir || '', depth + 1);
+  }
+  body.classList.toggle('open', opening);
+  var chev = header.querySelector('.chevron');
+  if (chev) chev.classList.toggle('open', opening);
+  if (!openDirs[libId]) openDirs[libId] = {};
+  if (opening) openDirs[libId][key] = 1;
+  else delete openDirs[libId][key];
+}
+
+function keyDepth(k) {
+  if (k === '\u0000common') return 0;
+  var n = 1;
+  for (var i = 0; i < k.length; i++) if (k.charAt(i) === '/') n++;
+  return n;
+}
+
+function findTreeNode(root, key) {
+  var nodes = root.querySelectorAll('.tree-node');
+  for (var i = 0; i < nodes.length; i++) {
+    if (nodes[i].dataset.key === key) return nodes[i];
+  }
+  return null;
+}
+
+// 刷新后按原有展开状态逐级还原（祖先先展开，子级才能找到）
+function restoreOpenDirs(libId, root) {
+  var map = openDirs[libId];
+  if (!map) return;
+  var keys = Object.keys(map).sort(function(a, b) { return keyDepth(a) - keyDepth(b); });
+  var kept = {};
+  for (var i = 0; i < keys.length; i++) {
+    var node = ensurePath(root, libId, keys[i]);
+    if (!node) continue; // 目录已不存在则不再记录
+    kept[keys[i]] = 1;
+    var header = node.firstElementChild;
+    var body = header ? header.nextElementSibling : null;
+    if (!body) continue;
+    body.classList.add('open');
+    var chev = header.querySelector('.chevron');
+    if (chev) chev.classList.add('open');
+  }
+  openDirs[libId] = kept;
+}
+
+// 渲染整棵树的骨架：只建第一级（或壳目录节点），其余展开时再建
+// 注意：不能动 treeEl 自身的 open 类，否则刷新后整棵树会被 display:none 隐藏
+function renderTree(libId, treeEl) {
+  var ix = libCache[libId];
+  if (!ix) return;
+  treeEl.dataset.lib = libId;
+  treeEl.innerHTML = '';
+  if (ix.common) {
+    treeEl.insertAdjacentHTML('beforeend', commonNodeHtml(libId));
+  } else {
+    treeEl.dataset.loaded = '0';
+    treeEl.dataset.off = '0';
+    fillDirBody(treeEl, libId, '', 0);
+  }
+  restoreOpenDirs(libId, treeEl);
 }
 
 async function toggleLib(id, btn) {
@@ -2694,62 +2950,74 @@ async function toggleLib(id, btn) {
     return;
   }
   expandedLibs[id] = true;
-  if (!libCache[id]) {
-    var lib = await api('/api/libraries/' + id);
-    var fs = {};
-    for (var i = 0; i < lib.files.length; i++) {
-      var f = lib.files[i];
-      fs[f.path] = { etag: f.etag || '', size: parseInt(f.size) || 0, name: f.path.split('/').pop() };
-    }
-    libCache[id] = { files: fs, folders: buildFolders(fs), common: (lib.commonPath || '').replace(/^\/+|\/+$/g, '') };
+  var old = btn.textContent;
+  btn.textContent = '加载中…';
+  try {
+    await fetchLibIndex(id);
+  } catch (e) {
+    delete expandedLibs[id];
+    btn.textContent = old;
+    toast('加载库失败：' + e.message, 'error');
+    return;
   }
-  tree.innerHTML = renderTree(libCache[id].folders, libCache[id].files, id, libCache[id].common);
+  renderTree(id, tree);
   tree.classList.add('open');
   btn.textContent = '收起文件';
 }
 
+function toggleLibBtn(btn) {
+  toggleLib(btn.dataset.id, btn);
+}
+
 // 局部刷新指定库的文件树（不重建整个列表，避免删除后"闪一下"）
-// 保持该库展开状态，其他库 DOM 纹丝不动
+// 索引仍在内存中，无需重新下载整库；已展开的目录会被还原
 function refreshLibTree(libId) {
   var tree = document.getElementById('tree_' + libId);
   if (!tree) return;
   if (!libCache[libId]) {
-    // 缓存被删（removeFile/removeFolder 会 delete），重新拉取
-    api('/api/libraries/' + libId).then(function(lib) {
-      if (libCache[libId]) { return; }
-      var fs = {};
-      for (var i = 0; i < lib.files.length; i++) {
-        var f = lib.files[i];
-        fs[f.path] = { etag: f.etag || '', size: parseInt(f.size) || 0, name: f.path.split('/').pop() };
-      }
-      libCache[libId] = { files: fs, folders: buildFolders(fs), common: (lib.commonPath || '').replace(/^\/+|\/+$/g, '') };
-      if (tree.classList.contains('open')) {
-        tree.innerHTML = renderTree(libCache[libId].folders, libCache[libId].files, libId, libCache[libId].common);
-      }
+    fetchLibIndex(libId).then(function() {
+      var t = document.getElementById('tree_' + libId);
+      if (t && t.classList.contains('open')) renderTree(libId, t);
     }).catch(function() {});
     return;
   }
-  // 缓存还在，直接重渲染当前库的树（保持展开）
-  if (tree.classList.contains('open')) {
-    tree.innerHTML = renderTree(libCache[libId].folders, libCache[libId].files, libId, libCache[libId].common);
-  }
+  if (tree.classList.contains('open')) renderTree(libId, tree);
 }
 
+function removeFileBtn(btn) {
+  var row = btn.closest('.file-row');
+  if (!row) return;
+  removeFile(libIdOfTreeEl(btn), row.dataset.path, btn);
+}
+
+function removeFolderBtn(btn) {
+  var node = btn.closest('.tree-node');
+  if (!node) return;
+  removeFolder(libIdOfTreeEl(btn), node.dataset.dir);
+}
+
+function stripDirBtn(btn) {
+  var node = btn.closest('.tree-node');
+  if (!node) return;
+  stripDir(libIdOfTreeEl(btn), node.dataset.dir);
+}
+
+function stripCommonDirBtn(btn) {
+  stripCommonDir(libIdOfTreeEl(btn));
+}
+
+// 从内存索引直接生成 PUT 载荷，省掉一次整库下载
 function removeFile(libId, fp, el) {
   confirmDialog('删除此文件？<br><code>' + esc(fp) + '</code>', { ok: '删除', title: '删除文件' }, async function() {
     try {
-      delete libCache[libId];
-      var lib = await api('/api/libraries/' + libId);
-      var updated = [];
-      for (var i = 0; i < lib.files.length; i++) {
-        if (lib.files[i].path === fp) continue;
-        updated.push({ idx: updated.length, path: lib.files[i].path.replace(/\\/g, '/'), etag: lib.files[i].etag, size: lib.files[i].size });
-      }
-      await api('/api/libraries/' + libId, {
+      var ix = await fetchLibIndex(libId);
+      var payload = libFilesPayload(ix, function(p) { return p === fp; });
+      await api('/api/libraries/' + encodeURIComponent(libId), {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ files: updated })
+        body: JSON.stringify({ files: payload })
       });
+      indexRemoveFile(ix, fp);
       log('已删除：' + fp);
       refreshLibTree(libId);
     } catch(e) {
@@ -2758,23 +3026,28 @@ function removeFile(libId, fp, el) {
   });
 }
 
-function removeFolder(libId, dir, el) {
-  var all = filesUnder(libCache[libId].folders, dir);
+function removeFolder(libId, dir) {
+  var ix0 = libCache[libId];
+  var all = ix0 ? filesUnderDir(ix0.dirs, dir) : [];
   if (!all.length) return;
   confirmDialog('删除 <code>' + esc(dir) + '</code> 下的 ' + all.length + ' 个文件？', { ok: '删除', title: '删除文件夹' }, async function() {
     try {
-      delete libCache[libId];
-      var lib = await api('/api/libraries/' + libId);
-      var keep = [];
-      for (var i = 0; i < lib.files.length; i++) {
-        if (all.indexOf(lib.files[i].path) === -1)
-          keep.push({ idx: keep.length, path: lib.files[i].path.replace(/\\/g, '/'), etag: lib.files[i].etag, size: lib.files[i].size });
-      }
-      await api('/api/libraries/' + libId, {
+      var ix = await fetchLibIndex(libId);
+      var drop = {};
+      for (var i = 0; i < all.length; i++) drop[all[i]] = 1;
+      var payload = libFilesPayload(ix, function(p) { return drop[p] === 1; });
+      await api('/api/libraries/' + encodeURIComponent(libId), {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ files: keep })
+        body: JSON.stringify({ files: payload })
       });
+      indexRemoveDir(ix, dir);
+      if (openDirs[libId]) {
+        delete openDirs[libId][dir];
+        for (var k in openDirs[libId]) {
+          if (k.indexOf(dir + '/') === 0) delete openDirs[libId][k];
+        }
+      }
       log('已删除文件夹：' + dir + ' (' + all.length + ' 个)');
       refreshLibTree(libId);
     } catch(e) {
@@ -2786,21 +3059,24 @@ function removeFolder(libId, dir, el) {
 function stripDir(libId, dir) {
   confirmDialog('剥离文件夹 <code>' + esc(dir) + '</code> 的壳目录？<br>其下全部子节点将上移挂载到父级，<b>底层 path 元数据将同步更新</b>（已生成的 STRM 目录结构可能受影响）', { ok: '剥离', title: '剥离壳目录', danger: false }, async function() {
     try {
-      var lib = await api('/api/libraries/' + libId);
+      var ix = await fetchLibIndex(libId);
       var prefix = dir + '/';
+      var keys = Object.keys(ix.files);
       var updated = [];
-      for (var i = 0; i < lib.files.length; i++) {
-        var p = lib.files[i].path.replace(/\\/g, '/');
+      for (var i = 0; i < keys.length; i++) {
+        var p = keys[i];
         if (p === dir) continue;
         var np = p.indexOf(prefix) === 0 ? p.substring(dir.length + 1) : p;
-        updated.push({ idx: updated.length, path: np, etag: lib.files[i].etag, size: lib.files[i].size });
+        var f = ix.files[p];
+        updated.push({ idx: updated.length, path: np, etag: f.etag, size: f.size });
       }
-      await api('/api/libraries/' + libId, {
+      await api('/api/libraries/' + encodeURIComponent(libId), {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ files: updated })
       });
       delete libCache[libId];
+      delete openDirs[libId];
       log('已剥离壳目录：' + dir + '（元数据已更新）');
       refreshLibTree(libId);
     } catch(e) {
@@ -2820,6 +3096,7 @@ function stripCommonDir(libId) {
         body: JSON.stringify({ commonPath: '' })
       });
       delete libCache[libId];
+      delete openDirs[libId];
       log('已剥离壳目录：' + cmn + '（commonPath 已清空）');
       loadLibs();
     } catch(e) {
