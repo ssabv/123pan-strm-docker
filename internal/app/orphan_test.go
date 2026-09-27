@@ -47,22 +47,10 @@ func TestOrphanScanAndApply(t *testing.T) {
 	cfg.writeLibraryFile(cfg.LibPath("test-lib"), movieLib)
 	cfg.writeLibraryFile(cfg.LibPath("tv-lib"), tvLib)
 
-	// includeSubtitles=false: 字幕不算孤儿（本地本来就不生成字幕）
-	res := a.orphanScan(out, false)
-	if got := res["total_missing"].(int); got != 3 { // c.mkv + d.mkv + b.mkv
-		t.Fatalf("includeSubtitles=false 期望 3 个缺失, 实际 %d", got)
-	}
-	libs0 := res["libraries"].([]map[string]any)
-	for _, l := range libs0 {
-		if l["lib_id"] == "test-lib" && l["suspicious"].(bool) {
-			t.Fatalf("电影库缺失 2/4 (50%%) 不应标记 suspicious")
-		}
-	}
-
-	// includeSubtitles=true: c.srt 也是孤儿
-	res = a.orphanScan(out, true)
-	if got := res["total_missing"].(int); got != 4 {
-		t.Fatalf("includeSubtitles=true 期望 4 个缺失, 实际 %d", got)
+	// includeSubtitles 无关：字幕与视频一视同仁，本地缺了就算孤儿
+	res := a.orphanScan(out)
+	if got := res["total_missing"].(int); got != 4 { // c.mkv + c.srt + d.mkv + b.mkv
+		t.Fatalf("期望 4 个缺失, 实际 %d", got)
 	}
 
 	libs := res["libraries"].([]map[string]any)

@@ -10,7 +10,7 @@ import (
 )
 
 // orphanScan: 扫描全部库，返回本地已删条目清单（不执行删除）
-func (a *App) orphanScan(outputDir string, includeSubtitles bool) map[string]any {
+func (a *App) orphanScan(outputDir string) map[string]any {
 	cfg := a.cfg.Config()
 	if outputDir == "" {
 		outputDir = asString(cfg["output_dir"])
@@ -60,15 +60,13 @@ func (a *App) orphanScan(outputDir string, includeSubtitles bool) map[string]any
 			if VIDEO_EXTS[ext] {
 				expected = filepath.Join(catRoot, relWithoutSuffix(rel, ext)+".strm")
 				kind = "video"
-			} else if includeSubtitles && SUBTITLE_EXTS[ext] {
-				// 字幕只在开启"包含字幕"时才应该存在于本地，否则全部误报
+			} else if SUBTITLE_EXTS[ext] {
 				expected = filepath.Join(catRoot, rel)
 				kind = "sub"
 			} else {
 				continue
 			}
 			total++
-			totalChecked++
 			if !existSet[expected] {
 				missing = append(missing, map[string]any{
 					"path": asString(fm["path"]),
@@ -77,6 +75,7 @@ func (a *App) orphanScan(outputDir string, includeSubtitles bool) map[string]any
 				})
 			}
 		}
+		totalChecked += total
 		if len(missing) == 0 {
 			continue
 		}
