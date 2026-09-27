@@ -1083,13 +1083,13 @@ body {
 .dedup-card-tag { font-size: 12px; font-weight: 600; white-space: nowrap; }
 .dedup-card-tag.video { color: #b45309; }
 .dedup-card-tag.sub { color: #1d4ed8; }
-.dedup-card-meta { font-size: 12px; color: var(--text-tertiary, #888); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dedup-card-meta { font-size: 12px; color: var(--text-tertiary, #888); white-space: normal; word-break: break-all; line-height: 1.5; min-width: 0; overflow-wrap: anywhere; }
 .dedup-card-head .dedup-group-select { margin-left: auto; display: flex; align-items: center; gap: 5px; font-size: 12px; white-space: nowrap; cursor: pointer; }
 
-.dedup-file { display: flex; align-items: center; gap: 10px; padding: 9px 14px; cursor: pointer; transition: background 0.15s; }
+.dedup-file { display: flex; align-items: flex-start; gap: 10px; padding: 9px 14px; cursor: pointer; transition: background 0.15s; }
 .dedup-file:hover { background: var(--bg-hover, #f5f5f5); }
-.dedup-file input[type="checkbox"] { margin: 0; flex-shrink: 0; }
-.dedup-file-path { flex: 1; min-width: 0; font-size: 13px; color: var(--text-primary, #222); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dedup-file input[type="checkbox"] { margin: 0; flex-shrink: 0; margin-top: 3px; }
+.dedup-file-path { flex: 1; min-width: 0; font-size: 13px; color: var(--text-primary, #222); white-space: normal; word-break: break-all; overflow-wrap: anywhere; line-height: 1.55; }
 .dedup-file-size { flex-shrink: 0; font-size: 12px; color: var(--text-tertiary, #888); font-variant-numeric: tabular-nums; }
 
 /* 一键选重复项 按钮样式 */
