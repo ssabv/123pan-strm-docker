@@ -1813,6 +1813,13 @@ body {
             </svg>
             去重
           </button>
+          <button class="vp-btn danger sm" onclick="openOrphan()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="12" height="12">
+              <polyline points="3 6 5 6 21 6"/>
+              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+            </svg>
+            清理已删
+          </button>
         </div>
         <input type="file" id="restoreInput" accept=".json" class="hidden-input">
         
@@ -1992,6 +1999,35 @@ body {
     <div id="dedupList" class="dedup-list"></div>
     <div class="dedup-footer">
       <span class="dedup-progress" id="dedupProgress"></span>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="orphanDlg">
+  <div class="vp-modal dedup-modal">
+    <div class="modal-header dedup-header">
+      <div class="modal-icon" style="background:rgba(220,38,38,.10);color:#dc2626">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18">
+          <polyline points="3 6 5 6 21 6"/>
+          <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+          <line x1="10" y1="11" x2="10" y2="17"/>
+          <line x1="14" y1="11" x2="14" y2="17"/>
+        </svg>
+      </div>
+      <div>
+        <h3 class="modal-title">清理本地已删条目</h3>
+        <p class="modal-desc" style="margin-bottom:0">对比本地 STRM 与秒传库，列出本地已删但库里还有的条目；勾选确认后从秒传库移除（不碰云盘文件）</p>
+      </div>
+    </div>
+    <div class="dedup-toolbar">
+      <button class="dedup-sm-btn" id="orphanSelectAllBtn" onclick="orphanToggleAll(this)">全选</button>
+      <span class="dedup-count" id="orphanCount">扫描中...</span>
+      <button class="dedup-sm-btn" onclick="closeOrphan()">取消</button>
+      <button class="dedup-sm-btn danger-solid" id="orphanOkBtn" onclick="orphanApply()" disabled>移除选中</button>
+    </div>
+    <div id="orphanList" class="dedup-list"></div>
+    <div class="dedup-footer">
+      <span class="dedup-progress" id="orphanProgress"></span>
     </div>
   </div>
 </div>
@@ -3395,6 +3431,185 @@ function dedupApply() {
     toast('去重完成：删除 ' + done + ' 个重复文件' + (errs.length ? '，' + errs.length + ' 个库失败' : ''), errs.length ? 'error' : 'success');
     log('✓ MD5 去重：删除 ' + done + ' 个' + (errs.length ? '\n失败: ' + errs.join('\n') : ''));
     closeDedup();
+    loadLibs();
+  });
+}
+
+// ==================== 本地已删清理（反向同步） ====================
+var orphanData = null;    // scan 结果
+var orphanChecked = {};   // 勾选状态: "libId|path" -> true
+var orphanGroupActive = {}; // "libId|dir" -> bool，分组勾选激活态
+
+function openOrphan() {
+  document.getElementById('orphanDlg').classList.add('show');
+  document.getElementById('orphanCount').textContent = '扫描中...';
+  document.getElementById('orphanList').innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-tertiary, #888)">正在扫描本地 STRM 并与秒传库对比...</div>';
+  document.getElementById('orphanOkBtn').disabled = true;
+  document.getElementById('orphanOkBtn').textContent = '移除选中';
+  var allBtn = document.getElementById('orphanSelectAllBtn');
+  if (allBtn) allBtn.classList.remove('active');
+  orphanChecked = {};
+  orphanGroupActive = {};
+  api('/api/orphan/scan', { method: 'POST' }).then(function(d) {
+    orphanData = d;
+    renderOrphanList();
+  }).catch(function(e) {
+    document.getElementById('orphanList').innerHTML = '<div style="padding:20px;text-align:center;color:red">扫描失败: ' + esc(e.message || e) + '</div>';
+    document.getElementById('orphanCount').textContent = '扫描失败';
+  });
+}
+
+function closeOrphan() {
+  document.getElementById('orphanDlg').classList.remove('show');
+  orphanData = null;
+  orphanChecked = {};
+  orphanGroupActive = {};
+}
+
+function renderOrphanList() {
+  var d = orphanData;
+  var el = document.getElementById('orphanList');
+  if (!d || !d.libraries || !d.libraries.length) {
+    el.innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-tertiary, #888)">✅ 秒传库与本地一致，没有本地已删的条目</div>';
+    document.getElementById('orphanCount').textContent = '无本地已删条目 (0 个)';
+    updateOrphanOk();
+    return;
+  }
+  var h = '';
+  d.libraries.forEach(function(lib) {
+    var susHtml = '';
+    if (lib.suspicious) {
+      susHtml = '<span style="color:#dc2626;font-weight:600">⚠️ 缺失 ' + Math.round((lib.missing_ratio || 0) * 100) + '%，疑似输出目录变更/磁盘未挂载，请谨慎核对！</span>';
+    }
+    h += '<div class="dedup-lib-title">📚 ' + esc(lib.lib_name) + ' <span style="font-weight:400;color:var(--text-tertiary,#888)">(' + esc(lib.lib_id) + ' · 本地已删 ' + lib.missing_count + '/' + lib.total + ')</span> ' + susHtml + '</div>';
+    (lib.groups || []).forEach(function(g) {
+      var gkey = lib.lib_id + '|' + g.dir;
+      var gActive = orphanGroupActive[gkey] === true || g.files.every(function(f) { return orphanChecked[lib.lib_id + '|' + f.path]; });
+      h += '<div class="dedup-card">' +
+        '<div class="dedup-card-head">' +
+          '<span class="dedup-card-tag video">📁 ' + esc(g.dir) + '</span>' +
+          '<span class="dedup-card-meta">' + g.count + ' 个文件 · ' + fmtSize(g.size) + '</span>' +
+          '<label class="dedup-group-select" style="color:#dc2626;font-weight:' + (gActive ? 600 : 400) + '"><input type="checkbox" ' + (gActive ? 'checked' : '') + ' onchange="orphanToggleGroup(this,\'' + escAttr(lib.lib_id) + '\',\'' + escAttr(g.dir) + '\')"> 整部勾选</label>' +
+        '</div>';
+      g.files.forEach(function(f) {
+        var key = lib.lib_id + '|' + f.path;
+        h += '<label class="dedup-file" title="' + escAttr(f.path) + '">' +
+          '<input type="checkbox" data-key="' + escAttr(key) + '" ' + (orphanChecked[key] ? 'checked' : '') + ' onchange="orphanOnChange(this)">' +
+          '<span class="dedup-file-path">' + esc(f.path) + '</span>' +
+          '<span class="dedup-file-size">' + (f.kind === 'sub' ? '📝 ' : '🎬 ') + fmtSize(f.size) + '</span>' +
+        '</label>';
+      });
+      h += '</div>';
+    });
+  });
+  el.innerHTML = h;
+  updateOrphanCount();
+  updateOrphanOk();
+}
+
+// 分组（整部作品）勾选/取消
+function orphanToggleGroup(cb, libId, dir) {
+  if (!orphanData) return;
+  var gkey = libId + '|' + dir;
+  var checked = cb.checked;
+  orphanGroupActive[gkey] = checked;
+  orphanData.libraries.forEach(function(lib) {
+    if (lib.lib_id !== libId) return;
+    (lib.groups || []).forEach(function(g) {
+      if (g.dir !== dir) return;
+      g.files.forEach(function(f) {
+        var key = lib.lib_id + '|' + f.path;
+        if (checked) orphanChecked[key] = true;
+        else delete orphanChecked[key];
+      });
+    });
+  });
+  renderOrphanList();
+}
+
+function orphanOnChange(cb) {
+  if (cb.checked) orphanChecked[cb.getAttribute('data-key')] = true;
+  else delete orphanChecked[cb.getAttribute('data-key')];
+  updateOrphanCount();
+  updateOrphanOk();
+}
+
+function updateOrphanCount() {
+  var n = Object.keys(orphanChecked).length;
+  var total = orphanData ? orphanData.total_missing : 0;
+  document.getElementById('orphanCount').textContent = '本地已删共 ' + total + ' 个，已选 ' + n + ' 个';
+}
+
+// 全局全选/取消：疑似异常的库不参与全选，必须手动勾选
+function orphanToggleAll(btn) {
+  if (!orphanData) return;
+  var active = !btn.classList.contains('active');
+  orphanChecked = {};
+  orphanGroupActive = {};
+  if (active) {
+    orphanData.libraries.forEach(function(lib) {
+      if (lib.suspicious) return;
+      (lib.groups || []).forEach(function(g) {
+        orphanGroupActive[lib.lib_id + '|' + g.dir] = true;
+        g.files.forEach(function(f) {
+          orphanChecked[lib.lib_id + '|' + f.path] = true;
+        });
+      });
+    });
+  }
+  btn.classList.toggle('active', active);
+  renderOrphanList();
+}
+
+function updateOrphanOk() {
+  var n = Object.keys(orphanChecked).length;
+  var btn = document.getElementById('orphanOkBtn');
+  btn.disabled = n === 0;
+  btn.textContent = n > 0 ? ('移除选中 (' + n + ')') : '移除选中';
+}
+
+function orphanApply() {
+  var keys = Object.keys(orphanChecked);
+  if (!keys.length || !orphanData) return;
+
+  // 按库分组
+  var byLib = {};
+  keys.forEach(function(k) {
+    var i = k.indexOf('|');
+    var lid = k.substring(0, i), p = k.substring(i + 1);
+    if (!byLib[lid]) byLib[lid] = [];
+    byLib[lid].push(p);
+  });
+
+  // 是否勾到了疑似异常库的条目
+  var hasSuspicious = false;
+  orphanData.libraries.forEach(function(lib) {
+    if (lib.suspicious && byLib[lib.lib_id]) hasSuspicious = true;
+  });
+
+  var total = keys.length;
+  var susWarn = hasSuspicious ? '<br><b style="color:#dc2626">注意：勾选中包含疑似异常库的条目，请确认不是目录变更/磁盘未挂载导致的误报！</b>' : '';
+  confirmDialog('确认从秒传库移除选中的 <b>' + total + '</b> 个本地已删条目？<br><span style="font-size:12px;color:var(--text-tertiary, #888)">仅移除库内记录，不影响云盘文件；删除前自动备份库 JSON</span>' + susWarn, { ok: '确认移除', title: '清理确认' }, async function() {
+    var done = 0, errs = [];
+    var prog = document.getElementById('orphanProgress');
+    for (var lid in byLib) {
+      try {
+        prog.textContent = '正在处理 ' + lid + ' ...';
+        var r = await api('/api/orphan/apply', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ lib_id: lid, delete_paths: byLib[lid] })
+        });
+        if (r.ok) done += (r.removed || 0);
+        else errs.push(lid + ': ' + r.message);
+      } catch(e) {
+        errs.push(lid + ': ' + (e.message || e));
+      }
+    }
+    prog.textContent = '';
+    toast('清理完成：已从秒传库移除 ' + done + ' 个条目' + (errs.length ? '，' + errs.length + ' 个库失败' : ''), errs.length ? 'error' : 'success');
+    log('✓ 本地已删清理：移除 ' + done + ' 个' + (errs.length ? '\n失败: ' + errs.join('\n') : ''));
+    closeOrphan();
     loadLibs();
   });
 }

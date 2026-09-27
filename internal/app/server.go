@@ -81,6 +81,8 @@ func (a *App) handler() http.Handler {
 	mux.HandleFunc("/api/sync/all", a.handleSyncAll)
 	mux.HandleFunc("/api/dedup/scan", a.handleDedupScan)
 	mux.HandleFunc("/api/dedup/apply", a.handleDedupApply)
+	mux.HandleFunc("/api/orphan/scan", a.handleOrphanScan)
+	mux.HandleFunc("/api/orphan/apply", a.handleOrphanApply)
 	mux.HandleFunc("/api/pan/list", a.handlePanList)
 	mux.HandleFunc("/api/pan/export", a.handlePanExport)
 	mux.HandleFunc("/api/task/", a.handleTaskStatus)
@@ -354,6 +356,22 @@ func (a *App) handleDedupApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, a.dedupApply(req.LibID, req.DeletePaths))
+}
+
+// POST /api/orphan/scan
+func (a *App) handleOrphanScan(w http.ResponseWriter, r *http.Request) {
+	c := a.cfg.Config()
+	writeJSON(w, 200, a.orphanScan("", asBool(c["include_subtitles"])))
+}
+
+// POST /api/orphan/apply
+func (a *App) handleOrphanApply(w http.ResponseWriter, r *http.Request) {
+	var req DedupReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, a.orphanApply(req.LibID, req.DeletePaths))
 }
 
 // GET /api/pan/list?parentFileId=0
