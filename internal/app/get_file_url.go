@@ -28,7 +28,15 @@ func resetCacheForAccountChange(cacheData map[string]any, currentHash string) ma
 	return cacheData
 }
 
-// getFileURL: 对外入口，token 失效自动清除并重试一次
+// tokenResetThrottled: 播放失败清缓存重登是否已被限流（1 分钟最多触发一次）
+func tokenResetThrottled(cacheData map[string]any) bool {
+	if ltr, ok := cacheData["lastTokenResetTime"].(float64); ok {
+		return time.Now().Unix()-int64(ltr) < 60
+	}
+	return false
+}
+
+// getFileURL: 对外入口，token 失效自动清除并重试一次（1 分钟最多触发一次）
 func (a *App) getFileURL(name, etag string, size int64, fastMode bool) string {
 	url := a.getFileURLOnce(name, etag, size, fastMode)
 	if url == "" || strings.Contains(url, "222.186.21.40:33333/NGGYU.mp4") {
@@ -36,7 +44,14 @@ func (a *App) getFileURL(name, etag string, size int64, fastMode bool) string {
 		if cacheData == nil {
 			cacheData = map[string]any{}
 		}
+		// 限流：防止播放失败风暴(如批量请求同一失效资源)连环清缓存重登
+		if tokenResetThrottled(cacheData) {
+			log.Printf("[播放] 播放失败重登限流：1 分钟内已触发过，跳过清缓存重试: %s", name)
+			return url
+		}
 		if tok, _ := cacheData["accessToken"].(string); tok != "" {
+			// 先写限流时间戳再重试，并发播放同秒到达也只会触发一次
+			cacheData["lastTokenResetTime"] = float64(time.Now().Unix())
 			cacheData["accessToken"] = ""
 			cacheData["tokenCreateTime"] = ""
 			WriteJSONFile(a.cfg.CachePath, cacheData)
