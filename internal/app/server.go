@@ -360,8 +360,7 @@ func (a *App) handleDedupApply(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/orphan/scan
 func (a *App) handleOrphanScan(w http.ResponseWriter, r *http.Request) {
-	c := a.cfg.Config()
-	writeJSON(w, 200, a.orphanScan("", asBool(c["include_subtitles"])))
+	writeJSON(w, 200, a.orphanScan(""))
 }
 
 // POST /api/orphan/apply
